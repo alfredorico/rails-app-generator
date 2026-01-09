@@ -169,7 +169,7 @@ generate_rails_app() {
         ${DOCKER_USER_FLAG} \
         ruby:${RUBY_VERSION} \
         bash -c "gem install --no-document rails -v '~> ${RAILS_VERSION}' && \
-            rails new . --api --database=postgresql --skip-git --skip-test --skip-system-test --skip-bundle --force"; then
+            rails new . --api --database=postgresql --skip-git --skip-test --skip-system-test --force"; then
 
         log_error "Rails generation failed!"
         log_error "Cleaning up ${API_DIR}..."
@@ -192,21 +192,26 @@ configure_database_yml() {
     cp "$db_yml" "${db_yml}.backup"
 
     # Replace with our template
-    cat > "$db_yml" << 'EOF'
+    cat > "$db_yml" << EOF
 default: &default
   adapter: postgresql
   encoding: unicode
   pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
-  url: <%= ENV["DATABASE_URL"] %>
+  host: <%= ENV.fetch("DB_HOST") { "db" } %>
+  username: <%= ENV.fetch("DB_USERNAME") { "postgres" } %>
+  password: <%= ENV.fetch("DB_PASSWORD") { "postgres" } %>
 
 development:
   <<: *default
+  database: ${PROJECT_SNAKE}_development
 
 test:
   <<: *default
+  database: ${PROJECT_SNAKE}_test
 
 production:
   <<: *default
+  url: <%= ENV["DATABASE_URL"] %>
 EOF
 
     log_success "Database configuration updated"
@@ -299,7 +304,9 @@ services:
       - ./${API_DIR}:/app
       - bundle:/bundle
     environment: &app-env
-      DATABASE_URL: \${DATABASE_URL:-postgres://postgres:postgres@db:5432}
+      DB_HOST: db
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
       EDITOR: \${EDITOR:-nano}
     ports:
       - "3000:3000"
@@ -346,7 +353,9 @@ services:
       - ./${API_DIR}:/app
       - bundle:/bundle
     environment: &app-env
-      DATABASE_URL: \${DATABASE_URL:-postgres://postgres:postgres@db:5432}
+      DB_HOST: db
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
       EDITOR: \${EDITOR:-nano}
     ports:
       - "3000:3000"
