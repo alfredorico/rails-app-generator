@@ -171,7 +171,7 @@ generate_rails_app() {
         ${DOCKER_USER_FLAG} \
         ruby:${RUBY_VERSION} \
         bash -c "gem install --no-document rails -v '~> ${RAILS_VERSION}' && \
-            rails new . --api --database=postgresql --skip-git --skip-test --skip-system-test --force"; then
+            rails new . --api --database=postgresql --skip-test --skip-system-test --force"; then
 
         log_error "Rails generation failed!"
         log_error "Cleaning up ${API_DIR}..."
