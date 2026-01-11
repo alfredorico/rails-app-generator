@@ -163,9 +163,11 @@ generate_rails_app() {
     fi
 
     # Generate Rails app
+    # Note: HOME=/app prevents Bundler "/ is not writable" warning when running as non-root
     if ! docker run --rm -it \
         -v "$(pwd)/${API_DIR}:/app" \
         -w /app \
+        -e HOME=/app \
         ${DOCKER_USER_FLAG} \
         ruby:${RUBY_VERSION} \
         bash -c "gem install --no-document rails -v '~> ${RAILS_VERSION}' && \
