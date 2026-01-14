@@ -19,7 +19,9 @@ RUBY_VERSION="3.4"
 NODE_VERSION="22"
 POSTGRES_VERSION="15"
 RAILS_VERSION="8.1"
+REDIS_VERSION="7"
 REACT_TEMPLATE=""  # Empty means no React app
+WITH_SIDEKIQ=""    # Empty means no Sidekiq
 
 print_usage() {
     echo "Usage: $0 <project-name> [options]"
@@ -29,13 +31,16 @@ print_usage() {
     echo "  --node-version <version>     Node.js version (default: $NODE_VERSION)"
     echo "  --postgres-version <version> PostgreSQL version (default: $POSTGRES_VERSION)"
     echo "  --rails-version <version>    Rails version (default: $RAILS_VERSION)"
+    echo "  --redis-version <version>    Redis version (default: $REDIS_VERSION)"
     echo "  --react-ts                   Include React frontend with TypeScript"
     echo "  --react-js                   Include React frontend with JavaScript"
+    echo "  --with-sidekiq               Include Sidekiq for background jobs (adds Redis)"
     echo "  -h, --help                   Show this help message"
     echo ""
     echo "Example:"
     echo "  $0 myapp --react-ts"
     echo "  $0 myapp --react-js --ruby-version 3.3 --node-version 20"
+    echo "  $0 myapp --with-sidekiq"
 }
 
 log_info() {
@@ -83,6 +88,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --react-js)
             REACT_TEMPLATE="react"
+            shift
+            ;;
+        --redis-version)
+            REDIS_VERSION="$2"
+            shift 2
+            ;;
+        --with-sidekiq)
+            WITH_SIDEKIQ="true"
             shift
             ;;
         -*)
@@ -253,6 +266,87 @@ EOF
     log_success "CORS configured for http://localhost:5173"
 }
 
+configure_sidekiq() {
+    log_info "Configuring Sidekiq for background jobs..."
+
+    local gemfile="${API_DIR}/Gemfile"
+
+    # 1. Add sidekiq gem to Gemfile
+    echo 'gem "sidekiq"' >> "$gemfile"
+    log_info "Added sidekiq gem to Gemfile"
+
+    # 2. Create Sidekiq initializer
+    cat > "${API_DIR}/config/initializers/sidekiq.rb" << 'EOF'
+Sidekiq.configure_server do |config|
+  config.redis = { url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0") }
+end
+
+Sidekiq.configure_client do |config|
+  config.redis = { url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0") }
+end
+EOF
+    log_info "Created Sidekiq initializer"
+
+    # 3. Create sidekiq.yml configuration
+    cat > "${API_DIR}/config/sidekiq.yml" << 'EOF'
+:concurrency: 5
+:queues:
+  - default
+  - mailers
+EOF
+    log_info "Created sidekiq.yml configuration"
+
+    # 4. Configure ActiveJob to use Sidekiq
+    local app_config="${API_DIR}/config/application.rb"
+    sed -i.backup '/class Application < Rails::Application/a\
+\    config.active_job.queue_adapter = :sidekiq
+' "$app_config"
+    log_info "Configured ActiveJob to use Sidekiq adapter"
+
+    # 5. Add Sidekiq Web UI to routes
+    local routes_file="${API_DIR}/config/routes.rb"
+    cat > "$routes_file" << 'EOF'
+require "sidekiq/web"
+
+Rails.application.routes.draw do
+  mount Sidekiq::Web => "/sidekiq"
+
+  # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
+
+  # Reveal health status on /up that returns 200 if the app boots with no exceptions, otherwise 500.
+  # Can be used by load balancers and uptime monitors to verify that the app is live.
+  get "up" => "rails/health#show", as: :rails_health_check
+
+  # Defines the root path route ("/")
+  # root "posts#index"
+end
+EOF
+    log_info "Added Sidekiq Web UI route at /sidekiq"
+
+    # 6. Create example job
+    mkdir -p "${API_DIR}/app/jobs"
+    cat > "${API_DIR}/app/jobs/example_job.rb" << 'EOF'
+class ExampleJob < ApplicationJob
+  queue_as :default
+
+  def perform(name = "world")
+    # Simulate a long-running task
+    sleep 2
+
+    # Create a file to demonstrate the job ran
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+    filename = Rails.root.join("tmp", "hello_#{name}_#{timestamp}.txt")
+    File.write(filename, "Hello, #{name}! Job completed at #{Time.now}")
+
+    Rails.logger.info "ExampleJob completed for '#{name}' - created #{filename}"
+  end
+end
+EOF
+    log_info "Created ExampleJob at app/jobs/example_job.rb"
+
+    log_success "Sidekiq configured with Web UI at /sidekiq"
+}
+
 # Detect platform and check Docker availability
 detect_platform
 check_docker_available
@@ -276,6 +370,9 @@ log_info "Ruby: $RUBY_VERSION | Node: $NODE_VERSION | PostgreSQL: $POSTGRES_VERS
 if [[ -n "$REACT_TEMPLATE" ]]; then
     log_info "React template: $REACT_TEMPLATE"
 fi
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    log_info "Sidekiq: enabled (Redis $REDIS_VERSION)"
+fi
 
 # Check if directory exists
 if [[ -d "$PROJECT_NAME" ]]; then
@@ -294,9 +391,24 @@ log_info "Creating directory structure..."
 # ============================================================================
 log_info "Creating docker-compose.yml..."
 
-if [[ -n "$REACT_TEMPLATE" ]]; then
-    # Full docker-compose with frontend
-    cat > docker-compose.yml << EOF
+# Build depends_on list for api service
+API_DEPENDS_ON="db"
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    API_DEPENDS_ON="db\n      - redis"
+fi
+
+# Build environment variables for api service
+API_ENV_VARS="DB_HOST: db
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      EDITOR: \${EDITOR:-nano}"
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    API_ENV_VARS="${API_ENV_VARS}
+      REDIS_URL: redis://redis:6379/0"
+fi
+
+# Start docker-compose.yml with api service
+cat > docker-compose.yml << EOF
 services:
   api: &app-base
     build:
@@ -306,16 +418,32 @@ services:
       - ./${API_DIR}:/app
       - bundle:/bundle
     environment: &app-env
-      DB_HOST: db
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
-      EDITOR: \${EDITOR:-nano}
+      ${API_ENV_VARS}
     ports:
       - "3000:3000"
     stdin_open: true
     tty: true
     depends_on:
+      - ${API_DEPENDS_ON}
+EOF
+
+# Add sidekiq service if requested
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    cat >> docker-compose.yml << EOF
+
+  sidekiq:
+    <<: *app-base
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    ports: []
+    depends_on:
       - db
+      - redis
+EOF
+fi
+
+# Add frontend service if React is requested
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    cat >> docker-compose.yml << EOF
 
   frontend:
     build:
@@ -328,43 +456,24 @@ services:
       - "5173:5173"
     stdin_open: true
     tty: true
-
-  db:
-    image: postgres:${POSTGRES_VERSION}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-
-volumes:
-  postgres_data:
-  bundle:
-  node_packages:
 EOF
-else
-    # API-only docker-compose
-    cat > docker-compose.yml << EOF
-services:
-  api: &app-base
-    build:
-      context: ./${API_DIR}
-      dockerfile: Dockerfile.dev
+fi
+
+# Add redis service if Sidekiq is requested
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    cat >> docker-compose.yml << EOF
+
+  redis:
+    image: redis:${REDIS_VERSION}-alpine
     volumes:
-      - ./${API_DIR}:/app
-      - bundle:/bundle
-    environment: &app-env
-      DB_HOST: db
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
-      EDITOR: \${EDITOR:-nano}
+      - redis_data:/data
     ports:
-      - "3000:3000"
-    stdin_open: true
-    tty: true
-    depends_on:
-      - db
+      - "6379:6379"
+EOF
+fi
+
+# Add db service
+cat >> docker-compose.yml << EOF
 
   db:
     image: postgres:${POSTGRES_VERSION}
@@ -379,6 +488,13 @@ volumes:
   postgres_data:
   bundle:
 EOF
+
+# Add optional volumes
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    echo "  redis_data:" >> docker-compose.yml
+fi
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    echo "  node_packages:" >> docker-compose.yml
 fi
 
 # ============================================================================
@@ -386,9 +502,8 @@ fi
 # ============================================================================
 log_info "Creating Makefile..."
 
-if [[ -n "$REACT_TEMPLATE" ]]; then
-    # Full makefile with npm commands
-    cat > makefile << 'EOF'
+# Create base makefile (without catch-all rule - we'll add it at the end)
+cat > makefile << 'EOF'
 .PHONY: rails console test migrate setup
 
 bundle:
@@ -431,65 +546,36 @@ down:
 
 restart:
 	docker-compose restart
+EOF
+
+# Add npm command if React is included
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    cat >> makefile << 'EOF'
 
 npm:
 	docker-compose run --rm frontend npm $(filter-out $@,$(MAKECMDGOALS))
-
-# Catch-all rule for arguments
-%:
-	@:
-EOF
-else
-    # API-only makefile
-    cat > makefile << 'EOF'
-.PHONY: rails console test migrate setup
-
-bundle:
-	docker-compose run --rm api bundle $(filter-out $@,$(MAKECMDGOALS))
-
-# Rails commands
-rails:
-	docker-compose run --rm api bin/rails $(filter-out $@,$(MAKECMDGOALS))
-
-# Common shortcuts
-console:
-	docker-compose run --rm api bin/rails console
-
-test:
-	docker-compose run --rm api bin/rails test
-
-migrate:
-	docker-compose run --rm api bin/rails db:migrate
-
-pg:
-	docker-compose exec db psql -U postgres
-
-shell:
-	docker-compose run --rm api bash
-
-# Project setup
-setup:
-	docker-compose build --no-cache
-	docker-compose run --rm api bin/setup --skip-server
-	docker-compose run --rm -e RAILS_ENV=test api bin/rails db:create
-
-rspec:
-	docker-compose run --rm api bundle exec rspec $(filter-out $@,$(MAKECMDGOALS))
-
-up:
-	docker-compose up
-
-down:
-	docker-compose down
-
-restart:
-	docker-compose restart
-
-# Catch-all rule for arguments
-%:
-	@:
 EOF
 fi
+
+# Add sidekiq commands if Sidekiq is included
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    cat >> makefile << 'EOF'
+
+sidekiq:
+	docker-compose run --rm sidekiq
+
+redis-cli:
+	docker-compose exec redis redis-cli
+EOF
+fi
+
+# Add catch-all rule at the end
+cat >> makefile << 'EOF'
+
+# Catch-all rule for arguments
+%:
+	@:
+EOF
 
 # ============================================================================
 # Create Rails API directory and files
@@ -507,6 +593,11 @@ configure_database_yml
 # Configure CORS if React is selected
 if [[ -n "$REACT_TEMPLATE" ]]; then
     configure_cors
+fi
+
+# Configure Sidekiq if requested
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    configure_sidekiq
 fi
 
 # Dockerfile.dev for Rails
@@ -711,17 +802,55 @@ EOF
 # ============================================================================
 # Create README
 # ============================================================================
+
+# Build optional sections for README
+FRONTEND_TECH=""
+FRONTEND_COMMANDS=""
+FRONTEND_URL=""
+SIDEKIQ_TECH=""
+SIDEKIQ_COMMANDS=""
+SIDEKIQ_URL=""
+SIDEKIQ_SECTION=""
+
 if [[ -n "$REACT_TEMPLATE" ]]; then
     FRONTEND_TECH="Node.js ${NODE_VERSION}, React, Vite"
-    FRONTEND_SECTION="
-2. **Start the application**:
-
-   \`\`\`bash
-   make up
-   \`\`\`
-"
     FRONTEND_COMMANDS="| \`make npm <cmd>\` | Run any npm command |"
     FRONTEND_URL="- **Frontend**: http://localhost:5173"
+fi
+
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    SIDEKIQ_TECH="Sidekiq, Redis ${REDIS_VERSION}"
+    SIDEKIQ_COMMANDS="| \`make sidekiq\` | Run Sidekiq worker |
+| \`make redis-cli\` | Redis CLI |"
+    SIDEKIQ_URL="- **Sidekiq Dashboard**: http://localhost:3000/sidekiq
+- **Redis**: localhost:6379"
+    SIDEKIQ_SECTION="
+## Background Jobs
+
+This project includes Sidekiq for background job processing.
+
+### Running a Job
+
+From the Rails console (\`make console\`):
+
+\`\`\`ruby
+# Enqueue a job to run asynchronously
+ExampleJob.perform_later(\"your-name\")
+
+# Or run it immediately (for testing)
+ExampleJob.perform_now(\"your-name\")
+\`\`\`
+
+The ExampleJob creates a file in \`tmp/\` directory after a 2-second delay.
+
+### Monitoring
+
+Visit http://localhost:3000/sidekiq to monitor job queues and processing.
+"
+fi
+
+# Build project structure
+if [[ -n "$REACT_TEMPLATE" ]]; then
     PROJECT_STRUCTURE="
 \`\`\`
 ${PROJECT_NAME}/
@@ -731,16 +860,6 @@ ${PROJECT_NAME}/
 └── makefile             # Development shortcuts
 \`\`\`"
 else
-    FRONTEND_TECH=""
-    FRONTEND_SECTION="
-2. **Start the application**:
-
-   \`\`\`bash
-   make up
-   \`\`\`
-"
-    FRONTEND_COMMANDS=""
-    FRONTEND_URL=""
     PROJECT_STRUCTURE="
 \`\`\`
 ${PROJECT_NAME}/
@@ -753,12 +872,13 @@ fi
 cat > README.md << EOF
 # ${PROJECT_NAME}
 
-A dockerized full-stack application with Rails API backend${FRONTEND_TECH:+ and React frontend}.
+A dockerized full-stack application with Rails API backend${FRONTEND_TECH:+ and React frontend}${WITH_SIDEKIQ:+ with background job processing}.
 
 ## Tech Stack
 
 - **Backend**: Ruby ${RUBY_VERSION}, Rails ${RAILS_VERSION} (API mode)
 ${FRONTEND_TECH:+- **Frontend**: ${FRONTEND_TECH}}
+${SIDEKIQ_TECH:+- **Background Jobs**: ${SIDEKIQ_TECH}}
 - **Database**: PostgreSQL ${POSTGRES_VERSION}
 - **Containerization**: Docker & Docker Compose
 
@@ -799,13 +919,15 @@ ${FRONTEND_TECH:+- **Frontend**: ${FRONTEND_TECH}}
 | \`make rails <cmd>\` | Run any Rails command |
 | \`make bundle <cmd>\` | Run any Bundler command |
 ${FRONTEND_COMMANDS}
+${SIDEKIQ_COMMANDS}
 
 ### URLs
 
 - **API**: http://localhost:3000
 ${FRONTEND_URL}
+${SIDEKIQ_URL}
 - **Database**: localhost:5432
-
+${SIDEKIQ_SECTION}
 ## Project Structure
 ${PROJECT_STRUCTURE}
 EOF
@@ -815,9 +937,15 @@ EOF
 # ============================================================================
 log_info "Initializing git repository..."
 
+# Build commit message with optional components
+COMMIT_MSG="init: scaffold Rails ${RAILS_VERSION} API"
+[[ -n "$REACT_TEMPLATE" ]] && COMMIT_MSG="${COMMIT_MSG} + React (${REACT_TEMPLATE})"
+[[ -n "$WITH_SIDEKIQ" ]] && COMMIT_MSG="${COMMIT_MSG} + Sidekiq"
+COMMIT_MSG="${COMMIT_MSG} project with Docker"
+
 git init --quiet
 git add .
-git commit -m "init: scaffold Rails ${RAILS_VERSION} API${REACT_TEMPLATE:+ + React ($REACT_TEMPLATE)} project with Docker" --quiet
+git commit -m "$COMMIT_MSG" --quiet
 
 # ============================================================================
 # Done!
@@ -829,6 +957,9 @@ log_info "Rails ${RAILS_VERSION} API generated and configured"
 if [[ -n "$REACT_TEMPLATE" ]]; then
     log_info "React frontend configured with CORS support"
 fi
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+    log_info "Sidekiq configured with Redis and Web UI at /sidekiq"
+fi
 echo ""
 echo -e "${YELLOW}Next steps:${NC}"
 echo ""
@@ -839,5 +970,10 @@ echo "     make setup"
 echo ""
 echo "  3. Start the application:"
 echo "     make up"
+if [[ -n "$WITH_SIDEKIQ" ]]; then
+echo ""
+echo "  4. Test Sidekiq (from Rails console):"
+echo "     ExampleJob.perform_later(\"test\")"
+fi
 echo ""
 echo -e "${GREEN}Happy coding!${NC}"
