@@ -303,27 +303,7 @@ EOF
 ' "$app_config"
     log_info "Configured ActiveJob to use Sidekiq adapter"
 
-    # 5. Add Sidekiq Web UI to routes
-    local routes_file="${API_DIR}/config/routes.rb"
-    cat > "$routes_file" << 'EOF'
-require "sidekiq/web"
-
-Rails.application.routes.draw do
-  mount Sidekiq::Web => "/sidekiq"
-
-  # Define your application routes per the DSL in https://guides.rubyonrails.org/routing.html
-
-  # Reveal health status on /up that returns 200 if the app boots with no exceptions, otherwise 500.
-  # Can be used by load balancers and uptime monitors to verify that the app is live.
-  get "up" => "rails/health#show", as: :rails_health_check
-
-  # Defines the root path route ("/")
-  # root "posts#index"
-end
-EOF
-    log_info "Added Sidekiq Web UI route at /sidekiq"
-
-    # 6. Create example job
+    # 5. Create example job
     mkdir -p "${API_DIR}/app/jobs"
     cat > "${API_DIR}/app/jobs/example_job.rb" << 'EOF'
 class ExampleJob < ApplicationJob
@@ -394,7 +374,8 @@ log_info "Creating docker-compose.yml..."
 # Build depends_on list for api service
 API_DEPENDS_ON="db"
 if [[ -n "$WITH_SIDEKIQ" ]]; then
-    API_DEPENDS_ON="db\n      - redis"
+    API_DEPENDS_ON="db
+      - redis"
 fi
 
 # Build environment variables for api service
@@ -822,8 +803,7 @@ if [[ -n "$WITH_SIDEKIQ" ]]; then
     SIDEKIQ_TECH="Sidekiq, Redis ${REDIS_VERSION}"
     SIDEKIQ_COMMANDS="| \`make sidekiq\` | Run Sidekiq worker |
 | \`make redis-cli\` | Redis CLI |"
-    SIDEKIQ_URL="- **Sidekiq Dashboard**: http://localhost:3000/sidekiq
-- **Redis**: localhost:6379"
+    SIDEKIQ_URL="- **Redis**: localhost:6379"
     SIDEKIQ_SECTION="
 ## Background Jobs
 
@@ -842,10 +822,6 @@ ExampleJob.perform_now(\"your-name\")
 \`\`\`
 
 The ExampleJob creates a file in \`tmp/\` directory after a 2-second delay.
-
-### Monitoring
-
-Visit http://localhost:3000/sidekiq to monitor job queues and processing.
 "
 fi
 
@@ -958,7 +934,7 @@ if [[ -n "$REACT_TEMPLATE" ]]; then
     log_info "React frontend configured with CORS support"
 fi
 if [[ -n "$WITH_SIDEKIQ" ]]; then
-    log_info "Sidekiq configured with Redis and Web UI at /sidekiq"
+    log_info "Sidekiq configured with Redis"
 fi
 echo ""
 echo -e "${YELLOW}Next steps:${NC}"
