@@ -153,6 +153,42 @@ check_docker_available() {
     fi
 }
 
+create_rails_template() {
+    local template_file="$1"
+    local include_cors="$2"
+
+    cat > "$template_file" << 'TEMPLATE_EOF'
+# Rails Application Template
+# This template is used during rails new to configure the application
+
+TEMPLATE_EOF
+
+    # Add CORS configuration if React frontend is included
+    if [[ "$include_cors" == "true" ]]; then
+        cat >> "$template_file" << 'TEMPLATE_EOF'
+# Enable rack-cors gem (uncomment it in Gemfile)
+gsub_file 'Gemfile', /^# gem.*rack-cors.*$/, 'gem "rack-cors"'
+
+# Configure CORS initializer
+initializer 'cors.rb', <<~RUBY
+  Rails.application.config.middleware.insert_before 0, Rack::Cors do
+    allow do
+      origins 'http://localhost:5173'
+      resource(
+        '*',
+        headers: :any,
+        expose: ['access-token', 'expiry', 'token-type', 'Authorization'],
+        methods: [:get, :patch, :put, :delete, :post, :options, :show]
+      )
+    end
+  end
+RUBY
+TEMPLATE_EOF
+    fi
+
+    log_info "Rails template created at ${template_file}"
+}
+
 generate_rails_app() {
     log_info "Generating Rails ${RAILS_VERSION} application..."
 
@@ -160,6 +196,14 @@ generate_rails_app() {
     local DOCKER_USER_FLAG=""
     if [[ "$PLATFORM" == "linux" ]] || [[ "$PLATFORM" == "macos" ]]; then
         DOCKER_USER_FLAG="-u $(id -u):$(id -g)"
+    fi
+
+    # Create Rails template only if React frontend is included (for CORS setup)
+    local TEMPLATE_FLAG=""
+    local TEMPLATE_FILE="${API_DIR}/rails_template.rb"
+    if [[ -n "$REACT_TEMPLATE" ]]; then
+        create_rails_template "$TEMPLATE_FILE" "true"
+        TEMPLATE_FLAG="--template=/app/rails_template.rb"
     fi
 
     # Generate Rails app
@@ -171,7 +215,7 @@ generate_rails_app() {
         ${DOCKER_USER_FLAG} \
         ruby:${RUBY_VERSION} \
         bash -c "gem install --no-document rails -v '~> ${RAILS_VERSION}' && \
-            rails new . --api --database=postgresql --skip-test --skip-system-test --force"; then
+            rails new . --api --database=postgresql --skip-test --skip-system-test --force ${TEMPLATE_FLAG}"; then
 
         log_error "Rails generation failed!"
         log_error "Cleaning up ${API_DIR}..."
@@ -179,8 +223,8 @@ generate_rails_app() {
         exit 1
     fi
 
-    # Remove Rails-generated .git and .cache if present
-    rm -rf "${API_DIR}/.git" "${API_DIR}/.github" "${API_DIR}/.cache"
+    # Remove Rails-generated .git, .cache, and template file
+    rm -rf "${API_DIR}/.git" "${API_DIR}/.github" "${API_DIR}/.cache" "${API_DIR}/rails_template.rb"
 
     log_success "Rails application generated successfully"
 }
@@ -217,40 +261,6 @@ production:
 EOF
 
     log_success "Database configuration updated"
-}
-
-configure_cors() {
-    log_info "Configuring CORS for React frontend..."
-
-    local gemfile="${API_DIR}/Gemfile"
-    local cors_initializer="${API_DIR}/config/initializers/cors.rb"
-
-    # 1. Uncomment rack-cors gem (Rails API adds it commented by default)
-    if grep -q "^# gem.*rack-cors" "$gemfile"; then
-        sed -i.backup 's/^# gem.*rack-cors.*/gem "rack-cors"/' "$gemfile"
-        log_info "Uncommented rack-cors gem in Gemfile"
-    else
-        # Fallback: add if not present
-        sed -i.backup '/^gem "rails"/a gem "rack-cors"' "$gemfile"
-        log_info "Added rack-cors gem to Gemfile"
-    fi
-
-    # 2. Replace cors.rb with your configuration
-    cat > "$cors_initializer" << 'EOF'
-Rails.application.config.middleware.insert_before 0, Rack::Cors do
-  allow do
-    origins 'http://localhost:5173'
-    resource(
-      '*',
-      headers: :any,
-      expose: ['access-token', 'expiry', 'token-type', 'Authorization'],
-      methods: [:get, :patch, :put, :delete, :post, :options, :show]
-    )
-  end
-end
-EOF
-
-    log_success "CORS configured for http://localhost:5173"
 }
 
 # Detect platform and check Docker availability
@@ -503,11 +513,6 @@ generate_rails_app
 
 # Configure database.yml
 configure_database_yml
-
-# Configure CORS if React is selected
-if [[ -n "$REACT_TEMPLATE" ]]; then
-    configure_cors
-fi
 
 # Dockerfile.dev for Rails
 cat > "${API_DIR}/Dockerfile.dev" << EOF
