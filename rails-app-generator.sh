@@ -179,8 +179,8 @@ generate_rails_app() {
         exit 1
     fi
 
-    # Remove Rails-generated .git if present
-    rm -rf "${API_DIR}/.git" "${API_DIR}/.github"
+    # Remove Rails-generated .git and .cache if present
+    rm -rf "${API_DIR}/.git" "${API_DIR}/.github" "${API_DIR}/.cache"
 
     log_success "Rails application generated successfully"
 }
@@ -559,6 +559,13 @@ cat >> "${API_DIR}/.dockerignore" << 'EOF'
 # Additional Docker-specific ignores
 .bundle
 vendor/bundle
+EOF
+
+# Append to .gitignore (add .cache just in case)
+cat >> "${API_DIR}/.gitignore" << 'EOF'
+
+# Bundler cache
+.cache/
 EOF
 
 # ============================================================================
