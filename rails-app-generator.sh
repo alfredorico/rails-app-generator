@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# Rails + React Dockerized Project Generator
-# Generates a complete boilerplate for a Rails API + React frontend project
-# with Docker, PostgreSQL, and common development tooling.
+# Rails Dockerized Project Generator
+# Generates production-ready dockerized Rails projects:
+#   - API-only mode (default) with optional React frontend (--react-ts/--react-js)
+#   - Full-stack webapp mode with Hotwire (--webapp) and optional Tailwind CSS (--css tailwind)
+# All projects include Docker, PostgreSQL, and common development tooling.
 
 set -e
 
@@ -20,6 +22,8 @@ NODE_VERSION="22"
 POSTGRES_VERSION="15"
 RAILS_VERSION="8.1"
 REACT_TEMPLATE=""  # Empty means no React app
+WEBAPP_MODE=""     # Empty means API mode; "true" means full Rails app with Hotwire
+CSS_FRAMEWORK=""   # Empty means no CSS framework; "tailwind" for tailwindcss-rails
 
 print_usage() {
     echo "Usage: $0 <project-name> [options]"
@@ -31,11 +35,15 @@ print_usage() {
     echo "  --rails-version <version>    Rails version (default: $RAILS_VERSION)"
     echo "  --react-ts                   Include React frontend with TypeScript"
     echo "  --react-js                   Include React frontend with JavaScript"
+    echo "  --webapp                     Generate full Rails app with Hotwire (not API-only)"
+    echo "  --css <framework>            CSS framework (requires --webapp, only 'tailwind' supported)"
     echo "  -h, --help                   Show this help message"
     echo ""
-    echo "Example:"
-    echo "  $0 myapp --react-ts"
-    echo "  $0 myapp --react-js --ruby-version 3.3 --node-version 20"
+    echo "Examples:"
+    echo "  $0 myapp                         # Rails API only"
+    echo "  $0 myapp --react-ts              # Rails API + React TypeScript frontend"
+    echo "  $0 myapp --webapp                # Full Rails app with Hotwire"
+    echo "  $0 myapp --webapp --css tailwind # Full Rails app with Tailwind CSS"
 }
 
 log_info() {
@@ -85,6 +93,14 @@ while [[ $# -gt 0 ]]; do
             REACT_TEMPLATE="react"
             shift
             ;;
+        --webapp)
+            WEBAPP_MODE="true"
+            shift
+            ;;
+        --css)
+            CSS_FRAMEWORK="$2"
+            shift 2
+            ;;
         -*)
             log_error "Unknown option: $1"
             print_usage
@@ -112,6 +128,25 @@ fi
 # Validate project name (alphanumeric, hyphens, underscores)
 if [[ ! "$PROJECT_NAME" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
     log_error "Invalid project name. Use only letters, numbers, hyphens, and underscores. Must start with a letter."
+    exit 1
+fi
+
+# Validate --webapp and --react mutual exclusivity
+if [[ -n "$WEBAPP_MODE" ]] && [[ -n "$REACT_TEMPLATE" ]]; then
+    log_error "--webapp and --react-ts/--react-js are mutually exclusive."
+    log_error "Use --webapp for a full Rails app with Hotwire, or --react-ts/--react-js for a Rails API + React SPA."
+    exit 1
+fi
+
+# Validate --css requires --webapp
+if [[ -n "$CSS_FRAMEWORK" ]] && [[ -z "$WEBAPP_MODE" ]]; then
+    log_error "--css requires --webapp. CSS frameworks are only supported for full Rails webapp mode."
+    exit 1
+fi
+
+# Validate --css value
+if [[ -n "$CSS_FRAMEWORK" ]] && [[ "$CSS_FRAMEWORK" != "tailwind" ]]; then
+    log_error "Unsupported CSS framework: '$CSS_FRAMEWORK'. Only 'tailwind' is currently supported."
     exit 1
 fi
 
@@ -162,6 +197,15 @@ generate_rails_app() {
         DOCKER_USER_FLAG="-u $(id -u):$(id -g)"
     fi
 
+    # Build rails new flags
+    local RAILS_FLAGS="--database=postgresql --skip-test --skip-system-test --force"
+    if [[ -z "$WEBAPP_MODE" ]]; then
+        RAILS_FLAGS="--api ${RAILS_FLAGS}"
+    fi
+    if [[ -n "$CSS_FRAMEWORK" ]]; then
+        RAILS_FLAGS="${RAILS_FLAGS} --css ${CSS_FRAMEWORK}"
+    fi
+
     # Generate Rails app
     # Note: HOME=/app prevents Bundler "/ is not writable" warning when running as non-root
     if ! docker run --rm -it \
@@ -171,7 +215,7 @@ generate_rails_app() {
         ${DOCKER_USER_FLAG} \
         ruby:${RUBY_VERSION} \
         bash -c "gem install --no-document rails -v '~> ${RAILS_VERSION}' && \
-            rails new . --api --database=postgresql --skip-test --skip-system-test --force"; then
+            rails new . ${RAILS_FLAGS}"; then
 
         log_error "Rails generation failed!"
         log_error "Cleaning up ${API_DIR}..."
@@ -268,13 +312,26 @@ fi
 
 # Convert to snake_case for Rails conventions
 PROJECT_SNAKE=$(echo "$PROJECT_NAME" | sed 's/-/_/g')
-API_DIR="${PROJECT_NAME}-api"
+
+# Set directory and service name based on mode
+if [[ -n "$WEBAPP_MODE" ]]; then
+    API_DIR="${PROJECT_NAME}-app"
+    SERVICE_NAME="app"
+else
+    API_DIR="${PROJECT_NAME}-api"
+    SERVICE_NAME="api"
+fi
 WEB_DIR="${PROJECT_NAME}-web-react"
 
 log_info "Creating project: $PROJECT_NAME"
-log_info "Ruby: $RUBY_VERSION | Node: $NODE_VERSION | PostgreSQL: $POSTGRES_VERSION | Rails: $RAILS_VERSION"
 if [[ -n "$REACT_TEMPLATE" ]]; then
+    log_info "Ruby: $RUBY_VERSION | Node: $NODE_VERSION | PostgreSQL: $POSTGRES_VERSION | Rails: $RAILS_VERSION"
     log_info "React template: $REACT_TEMPLATE"
+else
+    log_info "Ruby: $RUBY_VERSION | PostgreSQL: $POSTGRES_VERSION | Rails: $RAILS_VERSION"
+fi
+if [[ -n "$WEBAPP_MODE" ]]; then
+    log_info "Mode: Full-stack webapp with Hotwire${CSS_FRAMEWORK:+ + Tailwind CSS}"
 fi
 
 # Check if directory exists
@@ -294,11 +351,10 @@ log_info "Creating directory structure..."
 # ============================================================================
 log_info "Creating docker-compose.yml..."
 
-if [[ -n "$REACT_TEMPLATE" ]]; then
-    # Full docker-compose with frontend
-    cat > docker-compose.yml << EOF
+# Start docker-compose.yml with main Rails service
+cat > docker-compose.yml << EOF
 services:
-  api: &app-base
+  ${SERVICE_NAME}: &app-base
     build:
       context: ./${API_DIR}
       dockerfile: Dockerfile.dev
@@ -316,6 +372,11 @@ services:
     tty: true
     depends_on:
       - db
+EOF
+
+# Add frontend service if React is requested
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    cat >> docker-compose.yml << EOF
 
   frontend:
     build:
@@ -328,43 +389,11 @@ services:
       - "5173:5173"
     stdin_open: true
     tty: true
-
-  db:
-    image: postgres:${POSTGRES_VERSION}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-
-volumes:
-  postgres_data:
-  bundle:
-  node_packages:
 EOF
-else
-    # API-only docker-compose
-    cat > docker-compose.yml << EOF
-services:
-  api: &app-base
-    build:
-      context: ./${API_DIR}
-      dockerfile: Dockerfile.dev
-    volumes:
-      - ./${API_DIR}:/app
-      - bundle:/bundle
-    environment: &app-env
-      DB_HOST: db
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
-      EDITOR: \${EDITOR:-nano}
-    ports:
-      - "3000:3000"
-    stdin_open: true
-    tty: true
-    depends_on:
-      - db
+fi
+
+# Add db service
+cat >> docker-compose.yml << EOF
 
   db:
     image: postgres:${POSTGRES_VERSION}
@@ -379,6 +408,10 @@ volumes:
   postgres_data:
   bundle:
 EOF
+
+# Add optional volumes
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    echo "  node_packages:" >> docker-compose.yml
 fi
 
 # ============================================================================
@@ -386,42 +419,41 @@ fi
 # ============================================================================
 log_info "Creating Makefile..."
 
-if [[ -n "$REACT_TEMPLATE" ]]; then
-    # Full makefile with npm commands
-    cat > makefile << 'EOF'
+# Create base makefile with SERVICE_NAME (uses EOF for variable expansion, Make $ escaped as \$)
+cat > makefile << EOF
 .PHONY: rails console test migrate setup
 
 bundle:
-	docker-compose run --rm api bundle $(filter-out $@,$(MAKECMDGOALS))
+	docker-compose run --rm ${SERVICE_NAME} bundle \$(filter-out \$@,\$(MAKECMDGOALS))
 
 # Rails commands
 rails:
-	docker-compose run --rm api bin/rails $(filter-out $@,$(MAKECMDGOALS))
+	docker-compose run --rm ${SERVICE_NAME} bin/rails \$(filter-out \$@,\$(MAKECMDGOALS))
 
 # Common shortcuts
 console:
-	docker-compose run --rm api bin/rails console
+	docker-compose run --rm ${SERVICE_NAME} bin/rails console
 
 test:
-	docker-compose run --rm api bin/rails test
+	docker-compose run --rm ${SERVICE_NAME} bin/rails test
 
 migrate:
-	docker-compose run --rm api bin/rails db:migrate
+	docker-compose run --rm ${SERVICE_NAME} bin/rails db:migrate
 
 pg:
 	docker-compose exec db psql -U postgres
 
 shell:
-	docker-compose run --rm api bash
+	docker-compose run --rm ${SERVICE_NAME} bash
 
 # Project setup
 setup:
 	docker-compose build --no-cache
-	docker-compose run --rm api bin/setup --skip-server
-	docker-compose run --rm -e RAILS_ENV=test api bin/rails db:create
+	docker-compose run --rm ${SERVICE_NAME} bin/setup --skip-server
+	docker-compose run --rm -e RAILS_ENV=test ${SERVICE_NAME} bin/rails db:create
 
 rspec:
-	docker-compose run --rm api bundle exec rspec $(filter-out $@,$(MAKECMDGOALS))
+	docker-compose run --rm ${SERVICE_NAME} bundle exec rspec \$(filter-out \$@,\$(MAKECMDGOALS))
 
 up:
 	docker-compose up
@@ -431,70 +463,42 @@ down:
 
 restart:
 	docker-compose restart
+EOF
+
+# Add npm command if React is included
+if [[ -n "$REACT_TEMPLATE" ]]; then
+    cat >> makefile << 'EOF'
 
 npm:
 	docker-compose run --rm frontend npm $(filter-out $@,$(MAKECMDGOALS))
-
-# Catch-all rule for arguments
-%:
-	@:
-EOF
-else
-    # API-only makefile
-    cat > makefile << 'EOF'
-.PHONY: rails console test migrate setup
-
-bundle:
-	docker-compose run --rm api bundle $(filter-out $@,$(MAKECMDGOALS))
-
-# Rails commands
-rails:
-	docker-compose run --rm api bin/rails $(filter-out $@,$(MAKECMDGOALS))
-
-# Common shortcuts
-console:
-	docker-compose run --rm api bin/rails console
-
-test:
-	docker-compose run --rm api bin/rails test
-
-migrate:
-	docker-compose run --rm api bin/rails db:migrate
-
-pg:
-	docker-compose exec db psql -U postgres
-
-shell:
-	docker-compose run --rm api bash
-
-# Project setup
-setup:
-	docker-compose build --no-cache
-	docker-compose run --rm api bin/setup --skip-server
-	docker-compose run --rm -e RAILS_ENV=test api bin/rails db:create
-
-rspec:
-	docker-compose run --rm api bundle exec rspec $(filter-out $@,$(MAKECMDGOALS))
-
-up:
-	docker-compose up
-
-down:
-	docker-compose down
-
-restart:
-	docker-compose restart
-
-# Catch-all rule for arguments
-%:
-	@:
 EOF
 fi
 
+# Add assets command if webapp mode
+if [[ -n "$WEBAPP_MODE" ]]; then
+    cat >> makefile << EOF
+
+assets:
+	docker-compose run --rm ${SERVICE_NAME} bin/rails assets:precompile
+EOF
+fi
+
+# Add catch-all rule at the end
+cat >> makefile << 'EOF'
+
+# Catch-all rule for arguments
+%:
+	@:
+EOF
+
 # ============================================================================
-# Create Rails API directory and files
+# Create Rails directory and files
 # ============================================================================
-log_info "Creating Rails API boilerplate..."
+if [[ -n "$WEBAPP_MODE" ]]; then
+    log_info "Creating Rails webapp boilerplate..."
+else
+    log_info "Creating Rails API boilerplate..."
+fi
 
 mkdir -p "${API_DIR}"
 
@@ -507,6 +511,13 @@ configure_database_yml
 # Configure CORS if React is selected
 if [[ -n "$REACT_TEMPLATE" ]]; then
     configure_cors
+fi
+
+# Determine Docker CMD based on mode
+if [[ "$CSS_FRAMEWORK" == "tailwind" ]]; then
+    DOCKER_CMD='CMD ["bash", "-c", "bin/rails tailwindcss:watch[always] & bin/rails server -b 0.0.0.0"]'
+else
+    DOCKER_CMD='CMD ["bin/rails", "server", "-b", "0.0.0.0"]'
 fi
 
 # Dockerfile.dev for Rails
@@ -537,7 +548,7 @@ ENTRYPOINT ["entrypoint.sh"]
 
 EXPOSE 3000
 
-CMD ["bin/rails", "server", "-b", "0.0.0.0"]
+${DOCKER_CMD}
 EOF
 
 # entrypoint.sh
@@ -711,40 +722,52 @@ EOF
 # ============================================================================
 # Create README
 # ============================================================================
+
+# Build optional sections for README
+FRONTEND_TECH=""
+FRONTEND_COMMANDS=""
+FRONTEND_URL=""
+WEBAPP_COMMANDS=""
+
 if [[ -n "$REACT_TEMPLATE" ]]; then
     FRONTEND_TECH="Node.js ${NODE_VERSION}, React, Vite"
-    FRONTEND_SECTION="
-2. **Start the application**:
-
-   \`\`\`bash
-   make up
-   \`\`\`
-"
     FRONTEND_COMMANDS="| \`make npm <cmd>\` | Run any npm command |"
     FRONTEND_URL="- **Frontend**: http://localhost:5173"
+fi
+
+if [[ -n "$WEBAPP_MODE" ]]; then
+    WEBAPP_COMMANDS="| \`make assets\` | Precompile assets |"
+fi
+
+# Determine backend description and app summary
+if [[ -n "$WEBAPP_MODE" ]]; then
+    BACKEND_DESC="Ruby ${RUBY_VERSION}, Rails ${RAILS_VERSION} (full-stack with Hotwire)"
+    if [[ "$CSS_FRAMEWORK" == "tailwind" ]]; then
+        BACKEND_DESC="${BACKEND_DESC}, Tailwind CSS"
+    fi
+    APP_DESC="A dockerized full-stack Rails web application with Hotwire${CSS_FRAMEWORK:+ and Tailwind CSS}."
+    APP_DIR_COMMENT="# Rails web application"
+else
+    BACKEND_DESC="Ruby ${RUBY_VERSION}, Rails ${RAILS_VERSION} (API mode)"
+    APP_DESC="A dockerized full-stack application with Rails API backend${FRONTEND_TECH:+ and React frontend}."
+    APP_DIR_COMMENT="# Rails API application"
+fi
+
+# Build project structure
+if [[ -n "$REACT_TEMPLATE" ]]; then
     PROJECT_STRUCTURE="
 \`\`\`
 ${PROJECT_NAME}/
-├── ${API_DIR}/          # Rails API application
+├── ${API_DIR}/          ${APP_DIR_COMMENT}
 ├── ${WEB_DIR}/          # React frontend application
 ├── docker-compose.yml   # Docker services configuration
 └── makefile             # Development shortcuts
 \`\`\`"
 else
-    FRONTEND_TECH=""
-    FRONTEND_SECTION="
-2. **Start the application**:
-
-   \`\`\`bash
-   make up
-   \`\`\`
-"
-    FRONTEND_COMMANDS=""
-    FRONTEND_URL=""
     PROJECT_STRUCTURE="
 \`\`\`
 ${PROJECT_NAME}/
-├── ${API_DIR}/          # Rails API application
+├── ${API_DIR}/          ${APP_DIR_COMMENT}
 ├── docker-compose.yml   # Docker services configuration
 └── makefile             # Development shortcuts
 \`\`\`"
@@ -753,11 +776,11 @@ fi
 cat > README.md << EOF
 # ${PROJECT_NAME}
 
-A dockerized full-stack application with Rails API backend${FRONTEND_TECH:+ and React frontend}.
+${APP_DESC}
 
 ## Tech Stack
 
-- **Backend**: Ruby ${RUBY_VERSION}, Rails ${RAILS_VERSION} (API mode)
+- **Backend**: ${BACKEND_DESC}
 ${FRONTEND_TECH:+- **Frontend**: ${FRONTEND_TECH}}
 - **Database**: PostgreSQL ${POSTGRES_VERSION}
 - **Containerization**: Docker & Docker Compose
@@ -791,7 +814,7 @@ ${FRONTEND_TECH:+- **Frontend**: ${FRONTEND_TECH}}
 | \`make down\` | Stop all services |
 | \`make restart\` | Restart all services |
 | \`make console\` | Rails console |
-| \`make shell\` | Bash shell in API container |
+| \`make shell\` | Bash shell in container |
 | \`make migrate\` | Run database migrations |
 | \`make test\` | Run Rails tests |
 | \`make rspec\` | Run RSpec tests |
@@ -799,10 +822,11 @@ ${FRONTEND_TECH:+- **Frontend**: ${FRONTEND_TECH}}
 | \`make rails <cmd>\` | Run any Rails command |
 | \`make bundle <cmd>\` | Run any Bundler command |
 ${FRONTEND_COMMANDS}
+${WEBAPP_COMMANDS}
 
 ### URLs
 
-- **API**: http://localhost:3000
+- **App**: http://localhost:3000
 ${FRONTEND_URL}
 - **Database**: localhost:5432
 
@@ -815,9 +839,19 @@ EOF
 # ============================================================================
 log_info "Initializing git repository..."
 
+# Build commit message with optional components
+if [[ -n "$WEBAPP_MODE" ]]; then
+    COMMIT_MSG="init: scaffold Rails ${RAILS_VERSION} full-stack"
+    [[ "$CSS_FRAMEWORK" == "tailwind" ]] && COMMIT_MSG="${COMMIT_MSG} + Tailwind CSS"
+else
+    COMMIT_MSG="init: scaffold Rails ${RAILS_VERSION} API"
+    [[ -n "$REACT_TEMPLATE" ]] && COMMIT_MSG="${COMMIT_MSG} + React (${REACT_TEMPLATE})"
+fi
+COMMIT_MSG="${COMMIT_MSG} project with Docker"
+
 git init --quiet
 git add .
-git commit -m "init: scaffold Rails ${RAILS_VERSION} API${REACT_TEMPLATE:+ + React ($REACT_TEMPLATE)} project with Docker" --quiet
+git commit -m "$COMMIT_MSG" --quiet
 
 # ============================================================================
 # Done!
@@ -825,7 +859,14 @@ git commit -m "init: scaffold Rails ${RAILS_VERSION} API${REACT_TEMPLATE:+ + Rea
 echo ""
 log_success "Project '${PROJECT_NAME}' created successfully!"
 echo ""
-log_info "Rails ${RAILS_VERSION} API generated and configured"
+if [[ -n "$WEBAPP_MODE" ]]; then
+    log_info "Rails ${RAILS_VERSION} full-stack web application generated and configured"
+    if [[ "$CSS_FRAMEWORK" == "tailwind" ]]; then
+        log_info "Tailwind CSS configured (standalone binary, no Node.js required)"
+    fi
+else
+    log_info "Rails ${RAILS_VERSION} API generated and configured"
+fi
 if [[ -n "$REACT_TEMPLATE" ]]; then
     log_info "React frontend configured with CORS support"
 fi
